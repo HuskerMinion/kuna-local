@@ -31,6 +31,10 @@ What you get:
 - **Storage:** parallel **NAND** (not clip-and-dump friendly — the UART route below is preferred).
 - **Software:** Linux 3.8.8 (BusyBox), Ambarella AMBoot bootloader, OpenSSH **6.4**.
 
+![KNP01 board (back) — Ambarella A5s, Atheros Wi-Fi (SDIO), the BLE companion module, and the bare test-pad field](docs/images/board-back.jpg)
+
+![Parallel NAND (SK Hynix, U3) — not clip-and-dump friendly, which is why the UART route wins](docs/images/nand.jpg)
+
 The camera already runs an RTSP server (`strm_svc`) on `0.0.0.0:554`, but a default-DROP firewall
 blocks the LAN from reaching it; the cloud gets in through an OpenVPN tunnel (`tun0`) and talks to
 Kuna over AWS IoT (MQTT). The whole game is: open 554 to the LAN, add our own root, cut the cloud.
@@ -40,7 +44,9 @@ Kuna over AWS IoT (MQTT). The whole game is: open 554 to the LAN, add our own ro
 ## The journey
 
 ### 1. Finding the serial console (the hard part)
-No populated header — the console is on bare gold test pads next to the SoC.
+No labeled serial header — the console turned out to be three **test pads on the board edge**:
+**TP1 = GND, TP2 = RX, TP3 = TX**. The hard part was figuring out *which* pads, since the board is
+covered in test points and several are red herrings.
 
 - **Traps that cost the most time:** several test pads near the NAND look like a UART but are
   the **NAND data/clock bus** — they never decode at any baud.
@@ -52,6 +58,16 @@ No populated header — the console is on bare gold test pads next to the SoC.
   **115200 8N1**. The mask-ROM prints `aaaa NAND BIOS: 0x00000000` on a clean, well-grounded capture.
 - **Grounding gotcha:** if adding your ground wire makes TX "go silent," the wire is shorting TX
   to an adjacent pad — move to a clean ground and confirm no continuity to TX.
+
+![The Ambarella A5s SoC (the board is dense with test points — the console trio is out on the edge)](docs/images/soc-testpoints.jpg)
+
+The console TX on a handheld scope: idle-high, a burst during the first seconds of boot, then back to high.
+
+![Console TX bursting during boot, then resting high](docs/images/uart-burst.jpg)
+
+Measuring the narrowest pulse (one bit) with the cursors → **115200 baud**:
+
+![Measuring one bit width on the scope](docs/images/bit-measure.jpg)
 
 ### 2. Interrupt AMBoot → root shell
 The bootROM prints one line, then AMBoot boots **silently** and Linux doesn't put a console on
