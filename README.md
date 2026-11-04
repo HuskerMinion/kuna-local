@@ -43,8 +43,7 @@ Kuna over AWS IoT (MQTT). The whole game is: open 554 to the LAN, add our own ro
 No populated header — the console is on bare gold test pads next to the SoC.
 
 - **Traps that cost the most time:** several test pads near the NAND look like a UART but are
-  the **NAND data/clock bus** — they never decode at any baud. And the obvious 8-pin SOIC by the
-  audio section is **not** flash; it's an **SGM4890 audio amplifier**.
+  the **NAND data/clock bus** — they never decode at any baud.
 - **How to find TX:** scope each candidate pad across a power-cycle. The console TX **idles high
   (~3.3 V), bursts for the first couple seconds of boot, then returns to high and stays there.**
   NAND/bus lines are continuously active or drop to 0 V when idle.
