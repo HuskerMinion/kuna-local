@@ -1,0 +1,16 @@
+# Never commit secrets or keys
+*.pem
+*_ecdsa
+*_rsa
+*_ed25519
+id_*
+authorized_keys
+secrets.yaml
+*.pot
+*.hash
+hash.txt
+
+# Local scratch
+*.log
+scratch/
+captures/

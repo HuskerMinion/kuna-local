@@ -1,0 +1,84 @@
+#!/bin/ash
+# Kuna local HA bridge - maps HTTP query params to kunadb get/put.
+# Served by busybox httpd as a CGI. Install at /opt/kuna/ha/cgi-bin/kuna (chmod +x).
+# URL: http://<cam>:8089/cgi-bin/kuna?do=<action>&...
+B=/opt/kuna/bin/kunadb
+printf 'Content-Type: application/json\r\n\r\n'
+
+val() { echo "$QUERY_STRING" | tr '&' '\n' | sed -n "s/^$1=//p" | head -1; }
+dec() { printf '%b' "$(echo "$1" | sed 's/+/ /g;s/%\(..\)/\\x\1/g')"; }
+get() { $B -g "$1" 2>/dev/null | grep "^$1 :" | sed "s/^$1 : //"; }
+
+DO=$(val do)
+case "$DO" in
+  state)
+    printf '{'
+    printf '"bulb":%s,'           "$(get DB_BULB_STATUS)"
+    printf '"brightness":%s,'     "$(get DB_LIGHT_BRIGHTNESS)"
+    printf '"override":%s,'       "$(get DB_USER_OVERRIDE)"
+    printf '"alarm":%s,'          "$(get DB_ALARM_ON)"
+    printf '"volume":%s,'         "$(get DB_AUDIO_VOLUME)"
+    printf '"motion_timeout":%s,' "$(get DB_MOTION_TIMEOUT)"
+    printf '"daytime":%s,'        "$(get DB_DAYTIME)"
+    printf '"led_override":%s,'   "$(get DB_LED_OVERRIDE)"
+    printf '"led_mask":%s,'       "$(get DB_LED_MASK)"
+    printf '"rtsp_active":%s'     "$(get DB_RTSP_ACTIVE)"
+    printf '}'
+    ;;
+  light)
+    if [ "$(val release)" = "1" ]; then
+      $B -p DB_USER_OVERRIDE -v '{"active":false,"bulb":false}' >/dev/null 2>&1
+    elif [ "$(val on)" = "1" ]; then
+      $B -p DB_USER_OVERRIDE -v '{"active":true,"bulb":true}' >/dev/null 2>&1
+    else
+      $B -p DB_USER_OVERRIDE -v '{"active":true,"bulb":false}' >/dev/null 2>&1
+    fi
+    echo '{"ok":true}' ;;
+  bright)
+    $B -p DB_LIGHT_BRIGHTNESS -v "$(val v)" >/dev/null 2>&1; echo '{"ok":true}' ;;
+  siren)
+    [ "$(val on)" = "1" ] && V=true || V=false
+    $B -p DB_ALARM_ON -v $V >/dev/null 2>&1; echo '{"ok":true}' ;;
+  volume)
+    $B -p DB_AUDIO_VOLUME -v "$(val v)" >/dev/null 2>&1; echo '{"ok":true}' ;;
+  play)
+    C=$(basename "$(dec "$(val clip)")"); V=$(val vol); [ -z "$V" ] && V=65536
+    F=/opt/kuna/share/audio_recordings/$C
+    [ -f "$F" ] && paplay --volume="$V" "$F" >/dev/null 2>&1
+    echo '{"ok":true}' ;;
+  led)
+    O=$(val override); M=$(val mask)
+    [ -n "$O" ] && $B -p DB_LED_OVERRIDE -v "$O" >/dev/null 2>&1
+    if [ -n "$M" ]; then [ "$M" = "1" ] && mv=true || mv=false; $B -p DB_LED_MASK -v $mv >/dev/null 2>&1; fi
+    echo '{"ok":true}' ;;
+  motiontimeout)
+    $B -p DB_MOTION_TIMEOUT -v "$(val v)" >/dev/null 2>&1; echo '{"ok":true}' ;;
+  record)
+    if [ "$(val on)" = "1" ]; then $B -p DB_RECORD_START -v '{"duration":60}' >/dev/null 2>&1
+    else $B -p DB_RECORD_STOP -v true >/dev/null 2>&1; fi
+    echo '{"ok":true}' ;;
+  get)
+    K=$(val k); printf '{"key":"%s","value":"%s"}' "$K" "$(get "$K")" ;;
+  set)
+    K=$(val k); $B -p "$K" -v "$(dec "$(val v)")" >/dev/null 2>&1; echo '{"ok":true}' ;;
+  clips)
+    printf '{"clips":['; first=1
+    for f in /opt/kuna/share/audio_recordings/*.wav; do
+      n=$(basename "$f"); [ $first -eq 1 ] && first=0 || printf ','; printf '"%s"' "$n"
+    done; printf ']}' ;;
+  wifiscan)
+    printf '{"networks":['
+    nmcli -t -f SSID dev wifi list 2>/dev/null | grep -v '^$' | sort -u | awk 'NR>1{printf ","} {printf "\"%s\"", $0}'
+    printf ']}' ;;
+  wifilist)
+    printf '{"saved":['
+    nmcli -t -f NAME con show 2>/dev/null | grep -v '^$' | awk 'NR>1{printf ","} {printf "\"%s\"", $0}'
+    printf ']}' ;;
+  wifijoin)
+    S=$(dec "$(val ssid)"); P=$(dec "$(val pass)")
+    nmcli dev wifi connect "$S" password "$P" >/dev/null 2>&1 && echo '{"ok":true}' || echo '{"ok":false}' ;;
+  wififorget)
+    nmcli con delete "$(dec "$(val ssid)")" >/dev/null 2>&1; echo '{"ok":true}' ;;
+  *)
+    echo '{"error":"unknown do","actions":["state","light","bright","siren","volume","play","led","motiontimeout","record","get","set","clips","wifiscan","wifilist","wifijoin","wififorget"]}' ;;
+esac

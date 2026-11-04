@@ -1,0 +1,147 @@
+# Kuna porch camera - local control package for Home Assistant.
+# Talks to the on-camera bridge (busybox httpd CGI -> kunadb) at :8089.
+#
+# SET YOUR CAMERA IP: replace CAMERA_IP below with your camera's LAN IP.
+#
+# Install: copy to  <config>/packages/kuna_porch_package.yaml
+# and ensure configuration.yaml has:
+#   homeassistant:
+#     packages: !include_dir_named packages
+# then Developer Tools -> YAML -> Restart.
+
+# ---- state poller: one REST sensor, attributes feed everything below ----
+rest:
+  - resource: "http://CAMERA_IP:8089/cgi-bin/kuna?do=state"
+    scan_interval: 10
+    sensor:
+      - name: "Porch Cam State"
+        unique_id: porch_cam_state
+        value_template: "{{ value_json.bulb }}"
+        json_attributes:
+          - bulb
+          - brightness
+          - alarm
+          - volume
+          - motion_timeout
+          - daytime
+          - led_override
+          - led_mask
+          - rtsp_active
+
+# ---- action endpoints ----
+rest_command:
+  porch_light_on:
+    url: "http://CAMERA_IP:8089/cgi-bin/kuna?do=light&on=1"
+  porch_light_off:
+    url: "http://CAMERA_IP:8089/cgi-bin/kuna?do=light&on=0"
+  porch_light_release:        # hand control back to schedule / motion
+    url: "http://CAMERA_IP:8089/cgi-bin/kuna?do=light&release=1"
+  porch_light_brightness:
+    url: "http://CAMERA_IP:8089/cgi-bin/kuna?do=bright&v={{ pct }}"
+  porch_siren:
+    url: "http://CAMERA_IP:8089/cgi-bin/kuna?do=siren&on={{ on }}"
+  porch_play:
+    url: "http://CAMERA_IP:8089/cgi-bin/kuna?do=play&clip={{ clip }}"
+  porch_volume:
+    url: "http://CAMERA_IP:8089/cgi-bin/kuna?do=volume&v={{ v }}"
+  porch_motion_timeout:
+    url: "http://CAMERA_IP:8089/cgi-bin/kuna?do=motiontimeout&v={{ v }}"
+  porch_led_mask:
+    url: "http://CAMERA_IP:8089/cgi-bin/kuna?do=led&mask={{ m }}"
+  porch_led_override:
+    url: "http://CAMERA_IP:8089/cgi-bin/kuna?do=led&override={{ v }}"
+
+template:
+  # ---- the porch light (on/off + brightness) ----
+  # (HA 2026 no longer accepts "platform: template" under light:/switch:)
+  - light:
+      - name: "Porch Light"
+        unique_id: porch_light
+        state: "{{ state_attr('sensor.porch_cam_state','bulb') }}"
+        level: >-
+          {{ (state_attr('sensor.porch_cam_state','brightness') | int(0) * 255 / 100) | int }}
+        turn_on:
+          - service: rest_command.porch_light_on
+        turn_off:
+          - service: rest_command.porch_light_off
+        set_level:
+          - service: rest_command.porch_light_brightness
+            data:
+              pct: "{{ (brightness | int(0) * 100 / 255) | int }}"
+          - service: rest_command.porch_light_on
+
+  # ---- siren + status-LED-off as switches ----
+  - switch:
+      - name: "Porch Siren"
+        unique_id: porch_siren
+        state: "{{ state_attr('sensor.porch_cam_state','alarm') }}"
+        turn_on:
+          service: rest_command.porch_siren
+          data: { on: 1 }
+        turn_off:
+          service: rest_command.porch_siren
+          data: { on: 0 }
+      - name: "Porch Status LED Off"
+        unique_id: porch_status_led_off
+        state: "{{ state_attr('sensor.porch_cam_state','led_mask') }}"
+        turn_on:
+          service: rest_command.porch_led_mask
+          data: { m: 1 }
+        turn_off:
+          service: rest_command.porch_led_mask
+          data: { m: 0 }
+
+  # ---- numbers, binary sensors, sound buttons ----
+  - number:
+      - name: "Porch Motion Timeout"
+        unique_id: porch_motion_timeout
+        unit_of_measurement: "s"
+        min: 5
+        max: 600
+        step: 5
+        state: "{{ state_attr('sensor.porch_cam_state','motion_timeout') | int(30) }}"
+        set_value:
+          service: rest_command.porch_motion_timeout
+          data: { v: "{{ value | int }}" }
+      - name: "Porch Volume"
+        unique_id: porch_volume
+        min: 0
+        max: 100
+        step: 5
+        state: "{{ state_attr('sensor.porch_cam_state','volume') | int(100) }}"
+        set_value:
+          service: rest_command.porch_volume
+          data: { v: "{{ value | int }}" }
+  - binary_sensor:
+      - name: "Porch Daytime"
+        unique_id: porch_daytime
+        state: "{{ state_attr('sensor.porch_cam_state','daytime') }}"
+      - name: "Porch RTSP Viewed"
+        unique_id: porch_rtsp_viewed
+        state: "{{ state_attr('sensor.porch_cam_state','rtsp_active') }}"
+  - button:
+      - name: "Porch Chime"
+        unique_id: porch_chime
+        press:
+          service: rest_command.porch_play
+          data: { clip: "chime.wav" }
+      - name: "Porch Dog Bark"
+        unique_id: porch_dog_bark
+        press:
+          service: rest_command.porch_play
+          data: { clip: "dog1.wav" }
+      - name: "Porch Light Auto (release)"
+        unique_id: porch_light_release
+        press:
+          service: rest_command.porch_light_release
+
+# ---- live video (RTSP) ----
+# Easiest to add the Generic Camera via the UI instead (Settings > Devices > Add
+# Integration > Generic Camera), stream source:
+#   rtsp://CAMERA_IP:554/stream1   (main)   /stream2 (sub)
+# Or uncomment below (needs the ffmpeg integration):
+# camera:
+#   - platform: generic
+#     name: Porch Cam
+#     stream_source: "rtsp://CAMERA_IP:554/stream1"
+#     rtsp_transport: tcp
