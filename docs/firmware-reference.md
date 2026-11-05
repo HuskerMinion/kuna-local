@@ -102,11 +102,24 @@ Status: ✅ ready via kunadb/bridge · 🟡 plausible, needs a little work · �
 | Light schedules / dusk-dawn offsets | `DB_SCHED_*`, `DB_DUSK_OFFSET`, `DB_DAWN_OFFSET` | ✅ |
 | Error-reboot counter in HA | `DB_REBOOTS` | ✅ |
 | On-device recording to file/NAS | `DB_RECORD_START/STOP/ACTIVE/RATE` | 🟡 (JSON shape TBD; NAND space limited → push to NAS) |
-| Two-way audio / intercom | `arecord` (mic) + `paplay` (speaker); worked via app before | 🟡 (confirmed half-duplex; live duplex = small opus path) |
-| JPEG snapshot endpoint | `kunaimage` / `kuna_img_control` / photo.conf | 🔬 (DO NOT run the control bins bare — they block/disrupt the pipeline; find a safe trigger) |
-| HLS / HTTP viewing (no RTSP RR teardown) | `record.conf.hls` / `.http` muxers | 🔬 (how to enable a second output without disturbing stream1) |
-| Audio-detect + glass-break events in HA | `audiodetect.conf`, `GlassBreak.bsm`; likely via "sight" | 🔬 (no direct kunadb key found; trace where detections surface) |
-| Digital PTZ presets | `libampmdptz` `set_dptz_param` | 🔬 (no kunadb key; needs a safe control path) |
+| Two-way audio / intercom | bridge `do=talk` (POST wav→speaker) + `do=listen` (mic→wav) | ✅ (both tested; live duplex still a separate opus path) |
+| JPEG snapshot | bridge `do=snapshot` serves live `/tmp/thumb/thumb.jpg` | ✅ (tested; use as Generic Camera still_image_url) |
+| HLS / HTTP viewing | `record.conf.hls` (TS→`/sdcard/video/`), `kunarest` :7777 | 🔬 (`/sdcard` NOT mounted; HLS needs storage + replaces RTSP on stream1) |
+| Audio-detect + glass-break events | `audiodetect.conf` (`GlassBreak1/2.bsm`) | 🔬 (both detectors `Enable*Detect=0`; enabling is a config flag, but still need to find where a detection surfaces — kunadb key or callback) |
+| Digital PTZ / zoom / privacy mask | `libampmdptz` (`AmPrivacyMaskDPTZ`, `iav_digital_zoom2`) | 🔴 (encoder-internal SDK only; no kunadb key or tool — would need a custom binary) |
+
+### Investigation notes (2026-11-05)
+- **`kunarest`** is a local HTTP server on **:7777** (`/api/v1/`, serves `image/jpeg`); the
+  camera also keeps a live JPEG at **`/tmp/thumb/thumb.jpg`** (refreshed ~1/s) — that's what
+  `do=snapshot` serves. The :7777 API is unmapped (could yield more endpoints).
+- **HLS**: `record.conf.hls` targets `/sdcard/video/` but `/sdcard` is an empty unmounted dir.
+  Needs a storage mount (NAND partition or NFS/CIFS) and swaps the main stream off RTSP.
+- **Detection**: `/etc/camera/audiodetect.conf` ships the glass-break models but has
+  `EnableAlertDetect=0` and `EnableAnalysisDetect=0`. Flipping those to 1 arms them; the open
+  question is where a hit is reported (no obvious kunadb key — likely the "sight"/`kunaimage`
+  path). Needs tracing before it's HA-usable.
+- **DO NOT execute `kuna_img_control` / `testbench`** (they block on the imaging IPC and
+  restart the live pipeline). `kunaimage` writes the thumbnail; don't poke it directly.
 
 ## Safety notes (learned the hard way)
 - **Never run `kuna_img_control` or `testbench` with no/`-h` args** — they block (connect to the
