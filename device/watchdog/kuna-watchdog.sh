@@ -1,149 +1,78 @@
 #!/bin/ash
-# kuna-watchdog.sh - on-camera safety net. NEVER reboots the unit.
+# kuna-watchdog.sh (v3) - keep the Wi-Fi stack scheduled ABOVE strm_svc. NEVER reboots.
 #
-# Replaces the two useful things the stock `kunabeat` watchdog did (Wi-Fi recovery)
-# WITHOUT its fatal habit of rebooting the whole camera on a loop. Adds a memory guard
-# for the slow strm_svc RSS creep that can OOM this 128 MB, swapless board after hours.
+# Root cause of the offline flaps: this is a single-core box, and strm_svc runs at
+# SCHED_RR priority 10 while wpa_supplicant ships at SCHED_RR priority 1 and NetworkManager
+# at SCHED_OTHER. Under streaming load strm_svc starves the Wi-Fi stack, the association
+# drops, and the camera goes offline. This watchdog continuously ensures wpa_supplicant and
+# NetworkManager are scheduled ABOVE strm_svc so the link survives load.
 #
-# Background (see device/setup/cloud-cut.md "Camera drops offline"):
-#   - strm_svc (the RTSP server) runs at REAL-TIME priority. When a client pulls both
-#     stream1 + stream2 continuously (e.g. a 24/7 NVR), the single-core A5s sits at
-#     load ~5 and strm_svc starves sshd / wpa_supplicant of CPU -> SSH times out, the
-#     Wi-Fi link can drop, and over hours the box wedges. Ping may still answer.
-#   - strm_svc is supervised by `kunamonitor`, so killing it is safe: it is respawned
-#     automatically (which also resets its RSS). That is what the memory guard relies on.
+# v3 CHANGES: REMOVED link-heal (it bounced healthy Wi-Fi via an unreliable gateway-ping test,
+# which made outages worse). Kept a (relaxed) memory guard. Added the RT-priority keeper.
 #
-# This watchdog does two things, each independently toggleable:
-#   1. LINK HEAL  - if the default gateway is unreachable for several checks, bounce
-#                   Wi-Fi via nmcli (down/up the connection). No reboot.
-#   2. MEM GUARD  - if MemFree drops below MIN_FREE_KB or strm_svc RSS exceeds
-#                   MAX_STRM_RSS_KB, kill strm_svc so kunamonitor respawns it fresh.
-#
-# Install:  /opt/kuna/ha/kuna-watchdog.sh  (chmod +x), started from the boot path the
-#           same way bridge.sh is (append a start line to kunanetrules.ash), e.g.:
-#               /opt/kuna/ha/kuna-watchdog.sh >/dev/null 2>&1 &
-# Disable at runtime:  touch /opt/kuna/ha/watchdog.off
-# Log (ring-trimmed; persistent so a reboot does not erase what the watchdog just did —
-#      writes happen only on actions, so flash wear is negligible):
-#      /opt/kuna/ha/kuna-watchdog.log
+# Install: /opt/kuna/ha/kuna-watchdog.sh (chmod +x), autostart from kunanetrules.ash.
+# Disable: touch /opt/kuna/ha/watchdog.off     Log: /opt/kuna/ha/kuna-watchdog.log
 
 ### ---- config ---------------------------------------------------------------
-GW="GATEWAY_IP"                 # default gateway to probe for link health (set this)
-WIFI_CON="YOUR_WIFI"            # nmcli connection name (nmcli -t -f NAME con show)
-WIFI_DEV="wlan0"
+ENABLE_PRIO=1                  # keep wpa_supplicant/NetworkManager above strm_svc
+WIFI_PRIO=30                   # SCHED_RR priority for wpa_supplicant (strm_svc is 10)
+NM_PRIO=20                     # SCHED_RR priority for NetworkManager
 
-ENABLE_LINK_HEAL=1              # bounce Wi-Fi when gateway unreachable
-ENABLE_MEM_GUARD=1             # restart strm_svc under memory pressure
+ENABLE_MEM_GUARD=1             # restart amba stack only under genuine memory pressure
+MIN_FREE_KB=8000               # MemFree floor (idle dips to ~9-20MB, so this rarely fires)
+MAX_STRM_RSS_KB=90000          # strm_svc RSS ceiling (idles ~41MB)
+STRM_COOLDOWN=600              # min seconds between amba restarts
 
-CHECK_EVERY=30                 # seconds between checks
-FAIL_BEFORE_HEAL=6             # consecutive failed gateway probes before considering a bounce
-                               # (6 x 30s = ~3 min: long enough to ride out transient CPU
-                               #  starvation from RT strm_svc, which can make our own ping fail)
-PING_COUNT=3                   # packets per probe; any reply counts as reachable
-PING_WAIT=4                    # seconds to wait per ping
-HEAL_COOLDOWN=180              # min seconds between heal evaluations
-MIN_FREE_KB=10000              # restart amba stack if MemFree falls below this. Idle MemFree
-                               # sits ~16-20 MB (with ~30 MB reclaimable cache on top), so this
-                               # is a genuine-pressure backstop, not the primary trigger.
-MAX_STRM_RSS_KB=70000          # primary trigger: restart if strm_svc RSS grows past this
-                               # (it idles ~30 MB, so this catches a real leak, ~2x baseline)
-STRM_COOLDOWN=600              # min seconds between strm_svc restarts
-
+CHECK_EVERY=15                 # seconds between checks
 OFF_FLAG=/opt/kuna/ha/watchdog.off
-LOG=/opt/kuna/ha/kuna-watchdog.log   # persistent (UBIFS); survives reboot. Action-only writes.
-LOG_MAX=2000                   # keep the log to the last N lines
+LOG=/opt/kuna/ha/kuna-watchdog.log
+LOG_MAX=2000
 ### ---------------------------------------------------------------------------
 
 log() {
   echo "$(date '+%F %T') $*" >> "$LOG"
-  # trim the ring
-  if [ "$(wc -l < "$LOG" 2>/dev/null || echo 0)" -gt "$LOG_MAX" ]; then
-    tail -n $((LOG_MAX/2)) "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"
-  fi
+  [ "$(wc -l < "$LOG" 2>/dev/null || echo 0)" -gt "$LOG_MAX" ] && \
+    { tail -n $((LOG_MAX/2)) "$LOG" > "$LOG.tmp" 2>/dev/null && mv "$LOG.tmp" "$LOG"; }
 }
-
 now() { cut -d. -f1 /proc/uptime; }
+prio_of() { chrt -p "$1" 2>/dev/null | sed -n 's/.*priority: *//p' | tail -1; }
+is_rr()   { chrt -p "$1" 2>/dev/null | grep -q SCHED_RR; }
 
-# Is the Wi-Fi genuinely up at L2? (carrier present AND NetworkManager says the conn is active)
-# Used to avoid bouncing Wi-Fi when the gateway merely looks unreachable because strm_svc
-# starved our ping of CPU, or the upstream (AP/router) hiccuped - bouncing helps neither.
-link_up() {
-  [ "$(cat /sys/class/net/"$WIFI_DEV"/carrier 2>/dev/null)" = "1" ] || return 1
-  nmcli -t -f NAME con show --active 2>/dev/null | grep -qx "$WIFI_CON" || return 1
-  return 0
-}
-
-gw_reachable() { ping -c"$PING_COUNT" -W"$PING_WAIT" "$GW" >/dev/null 2>&1; }
-
-strm_rss_kb() {
-  p=$(pidof strm_svc 2>/dev/null) || return 1
-  [ -n "$p" ] || return 1
-  grep VmRSS /proc/"$p"/status 2>/dev/null | awk '{print $2}'
+ensure_prio() {
+  # $1 = process name, $2 = wanted SCHED_RR priority
+  p=$(pidof "$1" 2>/dev/null | tr ' ' '\n' | head -1)
+  [ -n "$p" ] || return
+  if ! is_rr "$p" || [ "$(prio_of "$p")" != "$2" ]; then
+    chrt -r -p "$2" "$p" 2>/dev/null && log "set $1 (pid $p) -> SCHED_RR $2"
+  fi
 }
 
 mem_free_kb() { awk '/^MemFree:/{print $2}' /proc/meminfo; }
+strm_rss_kb() { p=$(pidof strm_svc 2>/dev/null); [ -n "$p" ] && grep VmRSS /proc/"$p"/status 2>/dev/null | awk '{print $2}'; }
 
-restart_strm() {
-  # Use kunamonitor's sanctioned amba-restart handler (SIGUSR1) rather than killing
-  # strm_svc directly: a direct kill can trip kunamonitor's "failed to restart amba
-  # processes -> reboot camera" path, and rebooting is exactly what we must avoid.
+restart_amba() {
   km=$(pidof kunamonitor 2>/dev/null)
-  if [ -n "$km" ]; then
-    log "mem-guard: SIGUSR1 -> kunamonitor (pid $km) to restart amba processes [$1]"
-    kill -USR1 "$km" 2>/dev/null
-  else
-    p=$(pidof strm_svc 2>/dev/null)
-    [ -n "$p" ] && { log "mem-guard: kunamonitor absent; restarting strm_svc (pid $p) [$1]"; kill "$p" 2>/dev/null; }
-  fi
+  [ -n "$km" ] && { log "mem-guard: SIGUSR1 -> kunamonitor to restart amba [$1]"; kill -USR1 "$km" 2>/dev/null; }
 }
 
-bounce_wifi() {
-  log "link-heal: gateway $GW unreachable -> bouncing Wi-Fi ($WIFI_CON/$WIFI_DEV)"
-  nmcli con down "$WIFI_CON" >/dev/null 2>&1
-  sleep 2
-  nmcli con up "$WIFI_CON" >/dev/null 2>&1 \
-    || { nmcli radio wifi off >/dev/null 2>&1; sleep 2; nmcli radio wifi on >/dev/null 2>&1; }
-}
-
-log "watchdog start (link_heal=$ENABLE_LINK_HEAL mem_guard=$ENABLE_MEM_GUARD gw=$GW con=$WIFI_CON)"
-fails=0
-last_heal=0
+log "watchdog v3 start (prio_keeper=$ENABLE_PRIO wifi=$WIFI_PRIO nm=$NM_PRIO mem_guard=$ENABLE_MEM_GUARD)"
 last_strm=0
-
 while true; do
   [ -f "$OFF_FLAG" ] && { sleep "$CHECK_EVERY"; continue; }
-  t=$(now)
 
-  # 1. LINK HEAL ------------------------------------------------------------
-  if [ "$ENABLE_LINK_HEAL" = "1" ]; then
-    if gw_reachable; then
-      fails=0
-    else
-      fails=$((fails+1))
-      if [ "$fails" -ge "$FAIL_BEFORE_HEAL" ] && [ $((t - last_heal)) -ge "$HEAL_COOLDOWN" ]; then
-        if link_up; then
-          # Wi-Fi is associated and carrier is up, yet the gateway is unreachable: almost
-          # always CPU starvation (RT strm_svc) or a brief upstream blip. Bouncing would
-          # drop a working link, so don't - just note it and back off.
-          log "link-heal: gateway $GW unreachable but Wi-Fi link up ($WIFI_CON) -> NOT bouncing (likely CPU starvation/upstream)"
-        else
-          bounce_wifi
-        fi
-        last_heal=$t
-        fails=0
-      fi
-    fi
+  # 1. PRIORITY KEEPER (the fix for the offline flaps)
+  if [ "$ENABLE_PRIO" = "1" ]; then
+    ensure_prio wpa_supplicant "$WIFI_PRIO"
+    ensure_prio NetworkManager "$NM_PRIO"
   fi
 
-  # 2. MEM GUARD ------------------------------------------------------------
-  if [ "$ENABLE_MEM_GUARD" = "1" ] && [ $((t - last_strm)) -ge "$STRM_COOLDOWN" ]; then
-    mf=$(mem_free_kb); rss=$(strm_rss_kb)
-    if [ -n "$mf" ] && [ "$mf" -lt "$MIN_FREE_KB" ]; then
-      restart_strm "MemFree=${mf}kB < ${MIN_FREE_KB}kB"
-      last_strm=$t
-    elif [ -n "$rss" ] && [ "$rss" -gt "$MAX_STRM_RSS_KB" ]; then
-      restart_strm "strm_svc RSS=${rss}kB > ${MAX_STRM_RSS_KB}kB"
-      last_strm=$t
+  # 2. MEM GUARD (genuine pressure only)
+  if [ "$ENABLE_MEM_GUARD" = "1" ]; then
+    t=$(now); mf=$(mem_free_kb); rss=$(strm_rss_kb)
+    if [ $((t - last_strm)) -ge "$STRM_COOLDOWN" ]; then
+      if [ -n "$mf" ] && [ "$mf" -lt "$MIN_FREE_KB" ]; then restart_amba "MemFree=${mf}kB"; last_strm=$t
+      elif [ -n "$rss" ] && [ "$rss" -gt "$MAX_STRM_RSS_KB" ]; then restart_amba "strm_svc RSS=${rss}kB"; last_strm=$t
+      fi
     fi
   fi
 
