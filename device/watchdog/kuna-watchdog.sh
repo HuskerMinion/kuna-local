@@ -36,8 +36,12 @@ ENABLE_LINK_HEAL=1              # bounce Wi-Fi when gateway unreachable
 ENABLE_MEM_GUARD=1             # restart strm_svc under memory pressure
 
 CHECK_EVERY=30                 # seconds between checks
-FAIL_BEFORE_HEAL=4             # consecutive failed gateway probes before bouncing Wi-Fi
-HEAL_COOLDOWN=180              # min seconds between Wi-Fi bounces
+FAIL_BEFORE_HEAL=6             # consecutive failed gateway probes before considering a bounce
+                               # (6 x 30s = ~3 min: long enough to ride out transient CPU
+                               #  starvation from RT strm_svc, which can make our own ping fail)
+PING_COUNT=3                   # packets per probe; any reply counts as reachable
+PING_WAIT=4                    # seconds to wait per ping
+HEAL_COOLDOWN=180              # min seconds between heal evaluations
 MIN_FREE_KB=10000              # restart amba stack if MemFree falls below this. Idle MemFree
                                # sits ~16-20 MB (with ~30 MB reclaimable cache on top), so this
                                # is a genuine-pressure backstop, not the primary trigger.
@@ -59,6 +63,17 @@ log() {
 }
 
 now() { cut -d. -f1 /proc/uptime; }
+
+# Is the Wi-Fi genuinely up at L2? (carrier present AND NetworkManager says the conn is active)
+# Used to avoid bouncing Wi-Fi when the gateway merely looks unreachable because strm_svc
+# starved our ping of CPU, or the upstream (AP/router) hiccuped - bouncing helps neither.
+link_up() {
+  [ "$(cat /sys/class/net/"$WIFI_DEV"/carrier 2>/dev/null)" = "1" ] || return 1
+  nmcli -t -f NAME con show --active 2>/dev/null | grep -qx "$WIFI_CON" || return 1
+  return 0
+}
+
+gw_reachable() { ping -c"$PING_COUNT" -W"$PING_WAIT" "$GW" >/dev/null 2>&1; }
 
 strm_rss_kb() {
   p=$(pidof strm_svc 2>/dev/null) || return 1
@@ -101,12 +116,19 @@ while true; do
 
   # 1. LINK HEAL ------------------------------------------------------------
   if [ "$ENABLE_LINK_HEAL" = "1" ]; then
-    if ping -c1 -W3 "$GW" >/dev/null 2>&1; then
+    if gw_reachable; then
       fails=0
     else
       fails=$((fails+1))
       if [ "$fails" -ge "$FAIL_BEFORE_HEAL" ] && [ $((t - last_heal)) -ge "$HEAL_COOLDOWN" ]; then
-        bounce_wifi
+        if link_up; then
+          # Wi-Fi is associated and carrier is up, yet the gateway is unreachable: almost
+          # always CPU starvation (RT strm_svc) or a brief upstream blip. Bouncing would
+          # drop a working link, so don't - just note it and back off.
+          log "link-heal: gateway $GW unreachable but Wi-Fi link up ($WIFI_CON) -> NOT bouncing (likely CPU starvation/upstream)"
+        else
+          bounce_wifi
+        fi
         last_heal=$t
         fails=0
       fi
