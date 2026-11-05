@@ -1,11 +1,18 @@
 # Optional binary patch: disable the RTSP RR inactivity teardown
 
-**Status: APPLIED 2026-11-05 on this unit (backup at `/opt/kuna/ha/libamstreamoutput.so.0.orig`).**
+**Status: TRIED 2026-11-05, then REVERTED — this patch is FLAWED, do NOT apply it as written.**
+Applying it (inflate the `select()` timeout to ~194 days) did stop the RTCP teardown, but it
+also **froze the video**: AmberSight stayed "connected" with a **black image**. Reverting to
+the backup (`/opt/kuna/ha/libamstreamoutput.so.0.orig`) immediately restored video. Lesson:
+the `select()` in `ClientThread` is not just a liveness timer — its timeout path also drives
+periodic work the RTP/video stream needs, so an infinite timeout stalls frames.
+A correct patch must neutralise ONLY the teardown decision (the branch to the
+"not responding -> TearDown" block) while leaving the normal select-timeout handling intact —
+NOT change the timeout value. That branch wasn't pinned precisely; left as future work.
+The unit currently runs the pristine (unpatched) lib. Background on the mechanism below.
 Reverse-engineering showed the camera's teardown timeout is **adaptive** (recomputed from the
 RTCP RR cadence in `HandleRtcpPacket`), so feeding the camera RR does not reliably stop the
-teardown and can even shorten the timeout. This patch makes the camera's client `select()`
-effectively never time out, so it stops tearing clients down on RR inactivity regardless of
-client behaviour; genuine disconnects are still detected via the socket closing.
+teardown and can even shorten the timeout.
 
 ## What causes the ~6-minute teardown
 `strm_svc` (the camera's RTSP server) is the Ambarella SDK stream stack. The client
