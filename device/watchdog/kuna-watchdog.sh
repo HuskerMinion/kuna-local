@@ -23,7 +23,9 @@
 #           same way bridge.sh is (append a start line to kunanetrules.ash), e.g.:
 #               /opt/kuna/ha/kuna-watchdog.sh >/dev/null 2>&1 &
 # Disable at runtime:  touch /opt/kuna/ha/watchdog.off
-# Log (ring, on tmpfs to spare flash):  /tmp/kuna-watchdog.log
+# Log (ring-trimmed; persistent so a reboot does not erase what the watchdog just did —
+#      writes happen only on actions, so flash wear is negligible):
+#      /opt/kuna/ha/kuna-watchdog.log
 
 ### ---- config ---------------------------------------------------------------
 GW="GATEWAY_IP"                 # default gateway to probe for link health (set this)
@@ -44,7 +46,7 @@ MAX_STRM_RSS_KB=70000          # primary trigger: restart if strm_svc RSS grows 
 STRM_COOLDOWN=600              # min seconds between strm_svc restarts
 
 OFF_FLAG=/opt/kuna/ha/watchdog.off
-LOG=/tmp/kuna-watchdog.log
+LOG=/opt/kuna/ha/kuna-watchdog.log   # persistent (UBIFS); survives reboot. Action-only writes.
 LOG_MAX=2000                   # keep the log to the last N lines
 ### ---------------------------------------------------------------------------
 
