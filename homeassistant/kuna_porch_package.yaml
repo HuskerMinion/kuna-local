@@ -250,10 +250,12 @@ template:
 # For announcements, TTS -> wav -> porch_talk; for a doorbell clip use the sound buttons above.
 # (Live continuous duplex intercom is a separate effort - see docs/firmware-reference.md.)
 
-# ---- live video (RTSP) ----
+# ---- live video (RTSP) + snapshot ----
 # Easiest to add the Generic Camera via the UI instead (Settings > Devices > Add
 # Integration > Generic Camera), stream source:
 #   rtsp://CAMERA_IP:554/stream1   (main)   /stream2 (sub)
+# and still image URL (JPEG snapshot, served from the camera's live thumbnail):
+#   http://CAMERA_IP:8089/cgi-bin/kuna?do=snapshot
 # Or uncomment below (needs the ffmpeg integration):
 # camera:
 #   - platform: generic
