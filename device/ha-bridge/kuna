@@ -1,28 +1,60 @@
 #!/bin/ash
-# Kuna local HA bridge - maps HTTP query params to kunadb get/put.
+# Kuna local HA bridge - maps HTTP query params to kunadb get/put (and audio in/out).
 # Served by busybox httpd as a CGI. Install at /opt/kuna/ha/cgi-bin/kuna (chmod +x).
 # URL: http://<cam>:8089/cgi-bin/kuna?do=<action>&...
 B=/opt/kuna/bin/kunadb
-printf 'Content-Type: application/json\r\n\r\n'
 
-val() { echo "$QUERY_STRING" | tr '&' '\n' | sed -n "s/^$1=//p" | head -1; }
-dec() { printf '%b' "$(echo "$1" | sed 's/+/ /g;s/%\(..\)/\\x\1/g')"; }
-get() { $B -g "$1" 2>/dev/null | grep "^$1 :" | sed "s/^$1 : //"; }
+val()  { echo "$QUERY_STRING" | tr '&' '\n' | sed -n "s/^$1=//p" | head -1; }
+dec()  { printf '%b' "$(echo "$1" | sed 's/+/ /g;s/%\(..\)/\\x\1/g')"; }
+get()  { $B -g "$1" 2>/dev/null | grep "^$1 :" | sed "s/^$1 : //"; }
+jget() { v=$(get "$1"); [ -z "$v" ] && echo null || echo "$v"; }   # null-safe for JSON
+jbool(){ [ "$1" = "1" ] && echo true || echo false; }
 
 DO=$(val do)
+
+# ---- binary-output actions: own their headers, then exit ----
+case "$DO" in
+  listen)   # capture mic to a wav and return it (two-way audio: listen)
+    SEC=$(val sec); [ -z "$SEC" ] && SEC=5
+    [ "$SEC" -gt 30 ] 2>/dev/null && SEC=30
+    printf 'Content-Type: audio/wav\r\n\r\n'
+    arecord -d "$SEC" -f S16_LE -r 16000 -c 1 -t wav 2>/dev/null
+    exit 0 ;;
+  talk)     # play a POSTed wav body through the speaker (two-way audio: talk)
+    printf 'Content-Type: application/json\r\n\r\n'
+    if [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ] 2>/dev/null; then
+      dd bs="$CONTENT_LENGTH" count=1 of=/tmp/talk.wav 2>/dev/null
+      V=$(val vol); [ -z "$V" ] && V=65536
+      if [ -s /tmp/talk.wav ]; then paplay --volume="$V" /tmp/talk.wav >/dev/null 2>&1; echo '{"ok":true}'
+      else echo '{"ok":false,"error":"empty body"}'; fi
+    else echo '{"ok":false,"error":"POST a wav body (Content-Length required)"}'; fi
+    exit 0 ;;
+esac
+
+printf 'Content-Type: application/json\r\n\r\n'
 case "$DO" in
   state)
     printf '{'
-    printf '"bulb":%s,'           "$(get DB_BULB_STATUS)"
-    printf '"brightness":%s,'     "$(get DB_LIGHT_BRIGHTNESS)"
-    printf '"override":%s,'       "$(get DB_USER_OVERRIDE)"
-    printf '"alarm":%s,'          "$(get DB_ALARM_ON)"
-    printf '"volume":%s,'         "$(get DB_AUDIO_VOLUME)"
-    printf '"motion_timeout":%s,' "$(get DB_MOTION_TIMEOUT)"
-    printf '"daytime":%s,'        "$(get DB_DAYTIME)"
-    printf '"led_override":%s,'   "$(get DB_LED_OVERRIDE)"
-    printf '"led_mask":%s,'       "$(get DB_LED_MASK)"
-    printf '"rtsp_active":%s'     "$(get DB_RTSP_ACTIVE)"
+    printf '"bulb":%s,'            "$(jget DB_BULB_STATUS)"
+    printf '"brightness":%s,'      "$(jget DB_LIGHT_BRIGHTNESS)"
+    printf '"override":%s,'        "$(jget DB_USER_OVERRIDE)"
+    printf '"alarm":%s,'           "$(jget DB_ALARM_ON)"
+    printf '"volume":%s,'          "$(jget DB_AUDIO_VOLUME)"
+    printf '"motion_timeout":%s,'  "$(jget DB_MOTION_TIMEOUT)"
+    printf '"motion_occurred":%s,' "$(jget DB_MOTION_OCCURRED)"
+    printf '"pir_event":%s,'       "$(jget DB_PIR_EVENT)"
+    printf '"sensitivity":%s,'     "$(jget DB_SENSITIVITY)"
+    printf '"daytime":%s,'         "$(jget DB_DAYTIME)"
+    printf '"gamma":%s,'           "$(jget DB_IMG_GAMMA)"
+    printf '"video_flip":%s,'      "$(jget DB_VIDEO_FLIP)"
+    printf '"overlay_ts":%s,'      "$(jget DB_OVERLAY_TIMESTAMP)"
+    printf '"overlay_motion":%s,'  "$(jget DB_OVERLAY_MOTION)"
+    printf '"dusk_offset":%s,'     "$(jget DB_DUSK_OFFSET)"
+    printf '"dawn_offset":%s,'     "$(jget DB_DAWN_OFFSET)"
+    printf '"led_override":%s,'    "$(jget DB_LED_OVERRIDE)"
+    printf '"led_mask":%s,'        "$(jget DB_LED_MASK)"
+    printf '"reboots":%s,'         "$(jget DB_REBOOTS)"
+    printf '"rtsp_active":%s'      "$(jget DB_RTSP_ACTIVE)"
     printf '}'
     ;;
   light)
@@ -53,6 +85,22 @@ case "$DO" in
     echo '{"ok":true}' ;;
   motiontimeout)
     $B -p DB_MOTION_TIMEOUT -v "$(val v)" >/dev/null 2>&1; echo '{"ok":true}' ;;
+  overlay)   # ts=0|1 (timestamp), motion=0|1 (motion box)
+    T=$(val ts); M=$(val motion)
+    [ -n "$T" ] && $B -p DB_OVERLAY_TIMESTAMP -v "$(jbool "$T")" >/dev/null 2>&1
+    [ -n "$M" ] && $B -p DB_OVERLAY_MOTION   -v "$(jbool "$M")" >/dev/null 2>&1
+    echo '{"ok":true}' ;;
+  flip)      # on=0|1 - flip the image 180
+    $B -p DB_VIDEO_FLIP -v "$(jbool "$(val on)")" >/dev/null 2>&1; echo '{"ok":true}' ;;
+  gamma)     # v=10..30 (gamma*10)
+    $B -p DB_IMG_GAMMA -v "$(val v)" >/dev/null 2>&1; echo '{"ok":true}' ;;
+  sensitivity) # v = motion slider value
+    $B -p DB_SENSITIVITY -v "$(val v)" >/dev/null 2>&1; echo '{"ok":true}' ;;
+  duskdawn)  # dusk=<min> dawn=<min> offsets (signed minutes)
+    D=$(val dusk); W=$(val dawn)
+    [ -n "$D" ] && $B -p DB_DUSK_OFFSET -v "$D" >/dev/null 2>&1
+    [ -n "$W" ] && $B -p DB_DAWN_OFFSET -v "$W" >/dev/null 2>&1
+    echo '{"ok":true}' ;;
   record)
     if [ "$(val on)" = "1" ]; then $B -p DB_RECORD_START -v '{"duration":60}' >/dev/null 2>&1
     else $B -p DB_RECORD_STOP -v true >/dev/null 2>&1; fi
@@ -80,5 +128,5 @@ case "$DO" in
   wififorget)
     nmcli con delete "$(dec "$(val ssid)")" >/dev/null 2>&1; echo '{"ok":true}' ;;
   *)
-    echo '{"error":"unknown do","actions":["state","light","bright","siren","volume","play","led","motiontimeout","record","get","set","clips","wifiscan","wifilist","wifijoin","wififorget"]}' ;;
+    echo '{"error":"unknown do","actions":["state","light","bright","siren","volume","play","led","motiontimeout","overlay","flip","gamma","sensitivity","duskdawn","record","talk","listen","get","set","clips","wifiscan","wifilist","wifijoin","wififorget"]}' ;;
 esac

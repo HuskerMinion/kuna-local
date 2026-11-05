@@ -23,9 +23,19 @@ rest:
           - alarm
           - volume
           - motion_timeout
+          - motion_occurred
+          - pir_event
+          - sensitivity
           - daytime
+          - gamma
+          - video_flip
+          - overlay_ts
+          - overlay_motion
+          - dusk_offset
+          - dawn_offset
           - led_override
           - led_mask
+          - reboots
           - rtsp_active
 
 # ---- action endpoints ----
@@ -50,6 +60,20 @@ rest_command:
     url: "http://CAMERA_IP:8089/cgi-bin/kuna?do=led&mask={{ m }}"
   porch_led_override:
     url: "http://CAMERA_IP:8089/cgi-bin/kuna?do=led&override={{ v }}"
+  porch_overlay_ts:
+    url: "http://CAMERA_IP:8089/cgi-bin/kuna?do=overlay&ts={{ v }}"
+  porch_overlay_motion:
+    url: "http://CAMERA_IP:8089/cgi-bin/kuna?do=overlay&motion={{ v }}"
+  porch_flip:
+    url: "http://CAMERA_IP:8089/cgi-bin/kuna?do=flip&on={{ v }}"
+  porch_gamma:
+    url: "http://CAMERA_IP:8089/cgi-bin/kuna?do=gamma&v={{ v }}"
+  porch_sensitivity:
+    url: "http://CAMERA_IP:8089/cgi-bin/kuna?do=sensitivity&v={{ v }}"
+  porch_dusk_offset:
+    url: "http://CAMERA_IP:8089/cgi-bin/kuna?do=duskdawn&dusk={{ v }}"
+  porch_dawn_offset:
+    url: "http://CAMERA_IP:8089/cgi-bin/kuna?do=duskdawn&dawn={{ v }}"
 
 template:
   # ---- the porch light (on/off + brightness) ----
@@ -90,6 +114,33 @@ template:
         turn_off:
           service: rest_command.porch_led_mask
           data: { m: 0 }
+      - name: "Porch Timestamp Overlay"
+        unique_id: porch_overlay_ts
+        state: "{{ state_attr('sensor.porch_cam_state','overlay_ts') }}"
+        turn_on:
+          service: rest_command.porch_overlay_ts
+          data: { v: 1 }
+        turn_off:
+          service: rest_command.porch_overlay_ts
+          data: { v: 0 }
+      - name: "Porch Motion Overlay"
+        unique_id: porch_overlay_motion
+        state: "{{ state_attr('sensor.porch_cam_state','overlay_motion') }}"
+        turn_on:
+          service: rest_command.porch_overlay_motion
+          data: { v: 1 }
+        turn_off:
+          service: rest_command.porch_overlay_motion
+          data: { v: 0 }
+      - name: "Porch Video Flip"
+        unique_id: porch_video_flip
+        state: "{{ state_attr('sensor.porch_cam_state','video_flip') }}"
+        turn_on:
+          service: rest_command.porch_flip
+          data: { v: 1 }
+        turn_off:
+          service: rest_command.porch_flip
+          data: { v: 0 }
 
   # ---- numbers, binary sensors, sound buttons ----
   - number:
@@ -112,13 +163,64 @@ template:
         set_value:
           service: rest_command.porch_volume
           data: { v: "{{ value | int }}" }
+      - name: "Porch Motion Sensitivity"
+        unique_id: porch_sensitivity
+        min: 0
+        max: 100
+        step: 1
+        state: "{{ state_attr('sensor.porch_cam_state','sensitivity') | int(12) }}"
+        set_value:
+          service: rest_command.porch_sensitivity
+          data: { v: "{{ value | int }}" }
+      - name: "Porch Gamma"          # DB_IMG_GAMMA = gamma*10 (10=1.0 .. 30=3.0)
+        unique_id: porch_gamma
+        min: 10
+        max: 30
+        step: 1
+        state: "{{ state_attr('sensor.porch_cam_state','gamma') | int(16) }}"
+        set_value:
+          service: rest_command.porch_gamma
+          data: { v: "{{ value | int }}" }
+      - name: "Porch Dusk Offset"    # minutes before(-)/after(+) dusk the light turns on
+        unique_id: porch_dusk_offset
+        unit_of_measurement: "min"
+        min: -120
+        max: 120
+        step: 5
+        state: "{{ state_attr('sensor.porch_cam_state','dusk_offset') | int(0) }}"
+        set_value:
+          service: rest_command.porch_dusk_offset
+          data: { v: "{{ value | int }}" }
+      - name: "Porch Dawn Offset"    # minutes before(-)/after(+) dawn the light turns off
+        unique_id: porch_dawn_offset
+        unit_of_measurement: "min"
+        min: -120
+        max: 120
+        step: 5
+        state: "{{ state_attr('sensor.porch_cam_state','dawn_offset') | int(0) }}"
+        set_value:
+          service: rest_command.porch_dawn_offset
+          data: { v: "{{ value | int }}" }
   - binary_sensor:
       - name: "Porch Daytime"
         unique_id: porch_daytime
         state: "{{ state_attr('sensor.porch_cam_state','daytime') }}"
+      - name: "Porch Motion"
+        unique_id: porch_motion
+        device_class: motion
+        state: "{{ state_attr('sensor.porch_cam_state','motion_occurred') }}"
       - name: "Porch RTSP Viewed"
         unique_id: porch_rtsp_viewed
         state: "{{ state_attr('sensor.porch_cam_state','rtsp_active') }}"
+  - sensor:
+      # PIR event counter: it increments on each hardware-PIR trip. Trigger automations
+      # on a change of this value (distinct from video motion above).
+      - name: "Porch PIR Event Counter"
+        unique_id: porch_pir_event
+        state: "{{ state_attr('sensor.porch_cam_state','pir_event') | int(0) }}"
+      - name: "Porch Error Reboots"
+        unique_id: porch_error_reboots
+        state: "{{ state_attr('sensor.porch_cam_state','reboots').reboots | int(0) }}"
   - button:
       - name: "Porch Chime"
         unique_id: porch_chime
@@ -134,6 +236,19 @@ template:
         unique_id: porch_light_release
         press:
           service: rest_command.porch_light_release
+
+# ---- two-way audio ----
+# The bridge exposes two endpoints (not plain rest_commands because they carry audio):
+#   LISTEN:  GET  http://CAMERA_IP:8089/cgi-bin/kuna?do=listen&sec=5   -> returns a WAV
+#            (mic capture, max 30s). Fetch/save it, or point a media player at it.
+#   TALK:    POST a WAV body to http://CAMERA_IP:8089/cgi-bin/kuna?do=talk&vol=65536
+#            -> plays it through the speaker (push-to-talk / announcements).
+# Example shell_command (uncomment; needs curl on the HA host):
+# shell_command:
+#   porch_talk: "curl -s --data-binary @{{ file }} 'http://CAMERA_IP:8089/cgi-bin/kuna?do=talk'"
+#   porch_listen: "curl -s 'http://CAMERA_IP:8089/cgi-bin/kuna?do=listen&sec={{ sec }}' -o {{ out }}"
+# For announcements, TTS -> wav -> porch_talk; for a doorbell clip use the sound buttons above.
+# (Live continuous duplex intercom is a separate effort - see docs/firmware-reference.md.)
 
 # ---- live video (RTSP) ----
 # Easiest to add the Generic Camera via the UI instead (Settings > Devices > Add
