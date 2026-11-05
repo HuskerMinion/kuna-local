@@ -48,7 +48,9 @@ while true; do
   ts=$(date -u '+%FT%TZ')
   # ping (portable-ish: Linux ping)
   pms=$(ping -c1 -W2 "$CAM" 2>/dev/null | sed -n 's/.*time=\([0-9.]*\).*/\1/p')
-  if out=$($SSH "$REMOTE" 2>/dev/null) && [ -n "$out" ]; then
+  # Hard timeout around ssh: ConnectTimeout only covers connect, not a post-connect stall
+  # (the RT-starved camera can accept the TCP then hang), which would otherwise wedge the loop.
+  if out=$(timeout 15 $SSH "$REMOTE" 2>/dev/null) && [ -n "$out" ]; then
     set -- $out
     echo "$ts,ssh,${pms:-NA},$1,$2,$3,$4,$5,$6,$7" >> "$LOG"
   elif [ -n "$pms" ]; then
