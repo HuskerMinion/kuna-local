@@ -36,8 +36,11 @@ ENABLE_MEM_GUARD=1             # restart strm_svc under memory pressure
 CHECK_EVERY=30                 # seconds between checks
 FAIL_BEFORE_HEAL=4             # consecutive failed gateway probes before bouncing Wi-Fi
 HEAL_COOLDOWN=180              # min seconds between Wi-Fi bounces
-MIN_FREE_KB=16000              # restart strm_svc if MemFree falls below this
-MAX_STRM_RSS_KB=70000          # restart strm_svc if its RSS grows past this
+MIN_FREE_KB=10000              # restart amba stack if MemFree falls below this. Idle MemFree
+                               # sits ~16-20 MB (with ~30 MB reclaimable cache on top), so this
+                               # is a genuine-pressure backstop, not the primary trigger.
+MAX_STRM_RSS_KB=70000          # primary trigger: restart if strm_svc RSS grows past this
+                               # (it idles ~30 MB, so this catches a real leak, ~2x baseline)
 STRM_COOLDOWN=600              # min seconds between strm_svc restarts
 
 OFF_FLAG=/opt/kuna/ha/watchdog.off
@@ -64,12 +67,17 @@ strm_rss_kb() {
 mem_free_kb() { awk '/^MemFree:/{print $2}' /proc/meminfo; }
 
 restart_strm() {
-  p=$(pidof strm_svc 2>/dev/null)
-  [ -n "$p" ] || { log "mem-guard: strm_svc not running, nothing to restart"; return; }
-  log "mem-guard: killing strm_svc (pid $p) so kunamonitor respawns it [$1]"
-  kill "$p" 2>/dev/null
-  sleep 3
-  kill -9 "$p" 2>/dev/null   # if it ignored SIGTERM
+  # Use kunamonitor's sanctioned amba-restart handler (SIGUSR1) rather than killing
+  # strm_svc directly: a direct kill can trip kunamonitor's "failed to restart amba
+  # processes -> reboot camera" path, and rebooting is exactly what we must avoid.
+  km=$(pidof kunamonitor 2>/dev/null)
+  if [ -n "$km" ]; then
+    log "mem-guard: SIGUSR1 -> kunamonitor (pid $km) to restart amba processes [$1]"
+    kill -USR1 "$km" 2>/dev/null
+  else
+    p=$(pidof strm_svc 2>/dev/null)
+    [ -n "$p" ] && { log "mem-guard: kunamonitor absent; restarting strm_svc (pid $p) [$1]"; kill "$p" 2>/dev/null; }
+  fi
 }
 
 bounce_wifi() {

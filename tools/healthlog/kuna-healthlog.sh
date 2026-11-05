@@ -20,6 +20,9 @@ CAM="${CAM:-CAMERA_IP}"
 KEY="${KEY:-$HOME/.ssh/kuna_root_ecdsa}"
 INTERVAL="${INTERVAL:-60}"
 LOG="${LOG:-$HOME/kuna-health.csv}"
+MAX_ROWS="${MAX_ROWS:-20160}"   # cap on data rows (~14 days at 60s); header is always kept.
+                                # Oldest rows are dropped first, so the file never grows unbounded
+                                # while still holding plenty of history to inspect an incident.
 
 SSH="ssh -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
   -o IdentitiesOnly=yes -o ConnectTimeout=10 -o BatchMode=yes root@$CAM"
@@ -39,7 +42,8 @@ echo "$u ${l:-NA} ${mf:-NA} ${rss:-NA} ${th:-NA} ${c:-NA} ${dbm:-NA}"
 
 [ -f "$LOG" ] || echo "iso_time,reachable,ping_ms,uptime_s,load1,memfree_kb,strm_rss_kb,threads,conns554,wifi_dbm" > "$LOG"
 
-echo "$(date '+%F %T') healthlog start cam=$CAM interval=${INTERVAL}s -> $LOG"
+echo "$(date '+%F %T') healthlog start cam=$CAM interval=${INTERVAL}s max_rows=$MAX_ROWS -> $LOG"
+n=0
 while true; do
   ts=$(date -u '+%FT%TZ')
   # ping (portable-ish: Linux ping)
@@ -52,5 +56,15 @@ while true; do
   else
     echo "$ts,down,NA,NA,NA,NA,NA,NA,NA,NA" >> "$LOG"
   fi
+
+  # cap size: every ~60 samples, trim to header + last MAX_ROWS data rows (oldest dropped)
+  n=$((n+1))
+  if [ $((n % 60)) -eq 0 ] && [ -f "$LOG" ]; then
+    total=$(wc -l < "$LOG")
+    if [ "$total" -gt $((MAX_ROWS + 1)) ]; then
+      { head -n1 "$LOG"; tail -n "$MAX_ROWS" "$LOG"; } > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+    fi
+  fi
+
   sleep "$INTERVAL"
 done
