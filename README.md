@@ -162,9 +162,11 @@ ever differs (then you re-crack that one with the method above).
 
 ```
 device/ha-bridge/   on-camera HTTP->kunadb bridge (kuna CGI, bridge.sh, motion_led.sh)
+device/watchdog/    on-camera link/memory watchdog (heals Wi-Fi + strm_svc, never reboots)
 device/setup/       local RTSP, SSH, cloud-cut steps
 homeassistant/      HA package (set CAMERA_IP)
 tools/timepush/     push time to the camera from a LAN host
+tools/healthlog/    sample camera health from a LAN host to catch offline incidents
 tools/wifi/         provision/join/change Wi-Fi over USB or SSH, incl. from a QR code
 docs/               LED palette, Wi-Fi guide, images
 ```

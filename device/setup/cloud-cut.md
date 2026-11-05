@@ -67,6 +67,46 @@ ssh -i <your_key> root@<CAMERA_IP> \
 # expect: uid=0(root) ... / WAN_BLOCKED / no_tun0
 ```
 
+## 7. Camera drops offline / overload (diagnosis + watchdog)
+The A5s is a **single core** with **128 MB RAM and no swap**. A 24/7 NVR that pulls *both*
+RTSP streams at once (`stream1` main **and** `stream2` sub) pins it:
+
+- `strm_svc` (the RTSP server) runs at **real-time priority**. Under a dual-stream pull the
+  core sits at **load ~5**, and the RT `strm_svc` **starves `sshd` and `wpa_supplicant` of
+  CPU**. Symptom: **ping still answers but SSH times out**, and the Wi-Fi link can drop
+  because the supplicant can't run. It is not "the box is down" — it's CPU starvation.
+- `strm_svc` RSS creeps up over time. With no swap, after enough hours this exhausts RAM and
+  the unit wedges until a power cycle (first reboot alone won't help — the NVR reconnects both
+  streams and it re-overloads within minutes).
+- `pulseaudio` also runs at RT priority and burns a core when not suspended.
+
+**Confirm which it is:** from a LAN host, `ping <CAMERA_IP>` while `ssh` fails = starvation
+(not an outage). On the box: `cat /proc/loadavg`, `netstat -tn | grep -c ':554 '` (number of
+RTSP sessions), and per-process CPU/RSS. The kernel log is useless here — OSD debug spam
+overwrites `dmesg` within seconds and there is no `syslogd` — so run the health logger
+(`tools/healthlog/`) from a Pi to capture the next incident.
+
+### Fixes (no quality loss)
+1. **Record `stream1` only** on the NVR (full-res main). Stop pulling `stream2` 24/7. This
+   roughly halves the camera's load with zero loss to recorded quality. Biggest single win.
+2. **Front the camera with go2rtc/MediaMTX** on an always-on host: one RTSP session to the
+   camera, fanned out (passthrough copy, no re-encode) to the NVR and any live viewers. Caps
+   the camera at a single session no matter how many things watch.
+3. **Quiet the OSD log flood** (frees CPU, restores `dmesg`): `echo 3 > /proc/sys/kernel/printk`.
+   Persist it by adding that line to the boot path (`kunanetrules.ash`).
+4. **Suspend idle audio** (keeps audio, frees a core when nothing is playing): uncomment
+   `load-module module-suspend-on-idle` in `/etc/pulse/system.pa` and restart `pulseaudio`
+   (`kunapulse` respawns it). Recorded audio rides the encoder's AAC track, so it is unaffected.
+5. **Install the watchdog** (`device/watchdog/kuna-watchdog.sh`) as a safety net. It **never
+   reboots** the unit (unlike stock `kunabeat`): it bounces Wi-Fi via `nmcli` if the gateway
+   goes unreachable, and restarts just `strm_svc` (which `kunamonitor` respawns, resetting RSS)
+   under memory pressure. Install at `/opt/kuna/ha/kuna-watchdog.sh` and start it from the boot
+   path next to the HA bridge:
+   ```sh
+   echo '/opt/kuna/ha/kuna-watchdog.sh >/dev/null 2>&1 &' >> /opt/kuna/scripts/kunanetrules.ash
+   ```
+   Disable at runtime with `touch /opt/kuna/ha/watchdog.off`; it logs to `/tmp/kuna-watchdog.log`.
+
 ## Reverting a unit
 Restore every `*.orig`, remove the added `authorized_keys` line and the `PermitRootLogin yes`
-line, delete the HA bridge autostart line, and remove the router ACL.
+line, delete the HA bridge autostart line, the watchdog autostart line, and the router ACL.
