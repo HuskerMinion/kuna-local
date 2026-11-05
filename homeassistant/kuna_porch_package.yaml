@@ -12,7 +12,10 @@
 # ---- state poller: one REST sensor, attributes feed everything below ----
 rest:
   - resource: "http://CAMERA_IP:8089/cgi-bin/kuna?do=state"
-    scan_interval: 10
+    # Each poll forks ~20 kunadb reads on the camera's single RT-starved core, so keep this
+    # modest. 20s is a good balance; raise further if the camera feels loaded. (Real-time
+    # motion is handled on-device by motion_led.sh; HA polling is for logging/automations.)
+    scan_interval: 20
     sensor:
       - name: "Porch Cam State"
         unique_id: porch_cam_state

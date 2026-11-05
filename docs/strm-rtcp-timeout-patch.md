@@ -1,8 +1,11 @@
 # Optional binary patch: disable the RTSP RR inactivity teardown
 
-**Status: documented, NOT applied. The clean fix is the client sending RTCP RR
-(AmberSight), which is confirmed working. This patch is only for making the camera
-tolerant of ANY client that does not send RTCP Receiver Reports.**
+**Status: APPLIED 2026-11-05 on this unit (backup at `/opt/kuna/ha/libamstreamoutput.so.0.orig`).**
+Reverse-engineering showed the camera's teardown timeout is **adaptive** (recomputed from the
+RTCP RR cadence in `HandleRtcpPacket`), so feeding the camera RR does not reliably stop the
+teardown and can even shorten the timeout. This patch makes the camera's client `select()`
+effectively never time out, so it stops tearing clients down on RR inactivity regardless of
+client behaviour; genuine disconnects are still detected via the socket closing.
 
 ## What causes the ~6-minute teardown
 `strm_svc` (the camera's RTSP server) is the Ambarella SDK stream stack. The client
@@ -45,23 +48,29 @@ detected normally (socket becomes readable -> recv returns EOF, or select return
 the `ble` at 0x48e44 is still taken), so only the *silent-but-connected* timeout is removed.
 
 ## Apply (on the camera, as root) — back up first
+GOTCHAS (both cost real time once):
+- `/usr/lib/libamstreamoutput.so.0` is a **symlink** → `libamstreamoutput.so.0.1.0`. Do NOT
+  back up with `cp -a` (it copies the dangling symlink, 26 bytes). Use `cat` (follows it) and
+  **verify the backup is 414700 bytes before patching**. `od`/`dd` follow the symlink fine.
+- `0x48e00` = **298496** decimal. Use `$((0x48e00))`, never a hand-typed decimal (295936 =
+  0x48400 is a different, unrelated instruction — patching there corrupts the lib).
 ```sh
-cp -a /usr/lib/libamstreamoutput.so.0 /opt/kuna/ha/libamstreamoutput.so.0.orig
-# verify the original bytes before writing:
-od -An -tx1 -j $((0x48e00)) -N4 /usr/lib/libamstreamoutput.so.0   # expect: b0 c0 94 e5
-# write the 4 patched bytes at offset 0x48e00:
-printf '\x01\xc4\xa0\xe3' | dd of=/usr/lib/libamstreamoutput.so.0 bs=1 seek=$((0x48e00)) conv=notrunc
-# verify:
-od -An -tx1 -j $((0x48e00)) -N4 /usr/lib/libamstreamoutput.so.0   # expect: 01 c4 a0 e3
+L=/usr/lib/libamstreamoutput.so.0
+cat "$L" > /opt/kuna/ha/libamstreamoutput.so.0.orig          # real backup (follows symlink)
+[ "$(stat -c%s /opt/kuna/ha/libamstreamoutput.so.0.orig)" = 414700 ] || echo "BACKUP BAD - STOP"
+od -An -tx1 -j $((0x48e00)) -N4 "$L"                          # expect: b0 c0 94 e5
+printf '\x01\xc4\xa0\xe3' | dd of="$L" bs=1 seek=$((0x48e00)) conv=notrunc
+od -An -tx1 -j $((0x48e00)) -N4 "$L"                          # expect: 01 c4 a0 e3
 ```
 The lib is memory-mapped by the running `strm_svc`, so the change takes effect only after
-the amba stack reloads it: `pkill -USR1 $(pidof kunamonitor)` (restart amba processes) or
+the amba stack reloads it: `kill -USR1 $(pidof kunamonitor)` (restart amba processes) or
 reboot. Watch the health logger (`tools/healthlog/`) to confirm `strm_svc` stops cycling.
 
 ## Revert
 ```sh
-cp -a /opt/kuna/ha/libamstreamoutput.so.0.orig /usr/lib/libamstreamoutput.so.0
-pkill -USR1 $(pidof kunamonitor)   # or reboot
+L=/usr/lib/libamstreamoutput.so.0
+cat /opt/kuna/ha/libamstreamoutput.so.0.orig > "$L"   # follows symlink to the real file
+kill -USR1 $(pidof kunamonitor)                       # or reboot
 ```
 
 ## Caveats
