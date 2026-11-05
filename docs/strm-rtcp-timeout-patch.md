@@ -1,18 +1,18 @@
 # Optional binary patch: disable the RTSP RR inactivity teardown
 
-**Status: TRIED 2026-11-05, then REVERTED — this patch is FLAWED, do NOT apply it as written.**
-Applying it (inflate the `select()` timeout to ~194 days) did stop the RTCP teardown, but it
-also **froze the video**: AmberSight stayed "connected" with a **black image**. Reverting to
-the backup (`/opt/kuna/ha/libamstreamoutput.so.0.orig`) immediately restored video. Lesson:
-the `select()` in `ClientThread` is not just a liveness timer — its timeout path also drives
-periodic work the RTP/video stream needs, so an infinite timeout stalls frames.
-A correct patch must neutralise ONLY the teardown decision (the branch to the
-"not responding -> TearDown" block) while leaving the normal select-timeout handling intact —
-NOT change the timeout value. That branch wasn't pinned precisely; left as future work.
-The unit currently runs the pristine (unpatched) lib. Background on the mechanism below.
+**Status: APPLIED 2026-11-05 (corrected v2 patch at `0x48e44`). Video confirmed still flowing;
+`strm_svc` stopped cycling. Backup at `/opt/kuna/ha/libamstreamoutput.so.0.orig` (414700 B).**
+
 Reverse-engineering showed the camera's teardown timeout is **adaptive** (recomputed from the
 RTCP RR cadence in `HandleRtcpPacket`), so feeding the camera RR does not reliably stop the
-teardown and can even shorten the timeout.
+teardown and can even shorten the timeout — the fix has to be on the camera.
+
+### ⚠️ Do NOT use the first approach (inflating the select timeout at 0x48e00)
+The obvious-looking patch — change `ldr ip,[r4,#0xb0]` at `0x48e00` so the `select()` timeout
+is huge — **freezes the video** (AmberSight connected, black image). `0x48e00`'s value is not
+the select timeval; it is copied into a stream struct, and an infinite select also skips
+periodic work the RTP path needs. Tried it, got a black image, reverted. Use the branch patch
+below instead.
 
 ## What causes the ~6-minute teardown
 `strm_svc` (the camera's RTSP server) is the Ambarella SDK stream stack. The client
@@ -32,46 +32,46 @@ session logic lives in `libamstreamoutput.so.0`, class `CRtspClientSession`.
   49984: bl  am_warn           ; "...is not responding within %d seconds, shutdown!"
   4998c: bl  CRtspClientSession::TearDown
   ```
-So if no RR/data arrives within `[obj+0xb0]` seconds, `select()` times out and the
-session is torn down. That is the ~6-min drop. There is **no static timeout constant**
-to bump; the value is adaptive, so the patch targets the `select()` timeout load.
+So when `select()` returns `<= 0`, `0x48e44 ble 49954` leads (on `== 0`, a timeout) to the
+"not responding -> TearDown -> thread exit" block. That is the drop. The loop head is `0x48df8`
+(normal iterations branch back there), so the clean fix is: on a timeout, **branch back to the
+loop head instead of to teardown** — leaving the timeout value, the timeval, and all the
+per-iteration stream work untouched.
 
-## The patch (single instruction, 4 bytes)
-Make the `select()` timeout effectively infinite, so it only returns on real socket
-activity (RR/data) or a real error/close — never on an inactivity timeout.
+## The patch (single instruction, 4 bytes) — redirect the teardown branch to the loop
+Change the `select()<=0` branch so a timeout re-enters the select loop (`0x48df8`) instead of
+tearing the session down. Teardown becomes unreachable from the timeout path; a genuine
+disconnect is still caught on the data path (socket readable -> recv EOF).
 
-- **Target file:** `/usr/lib/libamstreamoutput.so.0`
+- **Target file:** `/usr/lib/libamstreamoutput.so.0`  (**symlink** → `libamstreamoutput.so.0.1.0`)
   - sha1 (this unit): `b275953bbace8b2c5478c3664b08d6569f0d788e`  size 414700
   - GNU build-id: `cec4711e3016cdbe6916414624940602f98f6379`
-  - (rootfs is shared across Kuna models, so the same lib/offset should apply elsewhere;
-    re-verify the bytes before patching any other unit.)
-- **File offset / vaddr:** `0x48e00` (.text has vaddr == file offset in this lib)
-- **Original bytes (LE):** `b0 c0 94 e5`  = `ldr ip, [r4, #0xb0]`  (e594c0b0)
-- **Patched  bytes (LE):** `01 c4 a0 e3`  = `mov ip, #0x01000000` (e3a0c401)
-  - 0x01000000 s ~= 194 days as `tv_sec` (positive, so no `select()` EINVAL).
+  - rootfs is shared across Kuna models, so the offset should apply elsewhere — **re-verify the
+    original bytes before patching any other unit.**
+- **File offset / vaddr:** `0x48e44` = **298564** decimal (.text vaddr == file offset here)
+- **Original bytes (LE):** `c2 02 00 da`  = `ble 49954`  (0xDA0002C2 — branch to teardown)
+- **Patched  bytes (LE):** `eb ff ff da`  = `ble 48df8`  (0xDAFFFFEB — branch to loop head)
 
-Effect: the inactivity teardown never fires. A genuine client disconnect is still
-detected normally (socket becomes readable -> recv returns EOF, or select returns <0 ->
-the `ble` at 0x48e44 is still taken), so only the *silent-but-connected* timeout is removed.
+(The branch offset: `0x48df8 - (0x48e44 + 8) = -0x54` → imm24 `0xFFFFEB`. Verify with
+`objdump` that the patched word disassembles to `ble 48df8` before trusting it.)
 
 ## Apply (on the camera, as root) — back up first
-GOTCHAS (both cost real time once):
-- `/usr/lib/libamstreamoutput.so.0` is a **symlink** → `libamstreamoutput.so.0.1.0`. Do NOT
-  back up with `cp -a` (it copies the dangling symlink, 26 bytes). Use `cat` (follows it) and
-  **verify the backup is 414700 bytes before patching**. `od`/`dd` follow the symlink fine.
-- `0x48e00` = **298496** decimal. Use `$((0x48e00))`, never a hand-typed decimal (295936 =
-  0x48400 is a different, unrelated instruction — patching there corrupts the lib).
+GOTCHAS (both cost real time once; learned the hard way):
+- The `.so` is a **symlink** → back up with `cat` (follows it), NOT `cp -a` (copies the 26-byte
+  dangling link). **Verify the backup is 414700 bytes before patching.** `od`/`dd` follow it.
+- `0x48e44` = **298564** decimal. Use `$((0x48e44))`, never a hand-typed number.
 ```sh
 L=/usr/lib/libamstreamoutput.so.0
 cat "$L" > /opt/kuna/ha/libamstreamoutput.so.0.orig          # real backup (follows symlink)
 [ "$(stat -c%s /opt/kuna/ha/libamstreamoutput.so.0.orig)" = 414700 ] || echo "BACKUP BAD - STOP"
-od -An -tx1 -j $((0x48e00)) -N4 "$L"                          # expect: b0 c0 94 e5
-printf '\x01\xc4\xa0\xe3' | dd of="$L" bs=1 seek=$((0x48e00)) conv=notrunc
-od -An -tx1 -j $((0x48e00)) -N4 "$L"                          # expect: 01 c4 a0 e3
+od -An -tx1 -j $((0x48e44)) -N4 "$L"                          # expect: c2 02 00 da
+printf '\xeb\xff\xff\xda' | dd of="$L" bs=1 seek=$((0x48e44)) conv=notrunc
+od -An -tx1 -j $((0x48e44)) -N4 "$L"                          # expect: eb ff ff da
 ```
-The lib is memory-mapped by the running `strm_svc`, so the change takes effect only after
-the amba stack reloads it: `kill -USR1 $(pidof kunamonitor)` (restart amba processes) or
-reboot. Watch the health logger (`tools/healthlog/`) to confirm `strm_svc` stops cycling.
+The lib is memory-mapped by the running `strm_svc`, so the change takes effect only after the
+amba stack reloads it: `kill -USR1 $(pidof kunamonitor)` (restart amba processes) or reboot.
+Then confirm BOTH: video still flows (`/tmp/thumb/thumb.jpg` keeps updating ~1/s — not black)
+AND `strm_svc` stops cycling (pid holds, logger shows no `down`s past the old ~6-min window).
 
 ## Revert
 ```sh
