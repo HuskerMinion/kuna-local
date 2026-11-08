@@ -55,9 +55,31 @@ This severs AWS IoT + heartbeat + any update download in one rule, while LAN↔L
 your NVR and SSH still reach the camera.
 
 ## 5. Clock / time (no RTC on this board)
-The board has no RTC, so the clock resets on every boot, and with WAN blocked it can't reach a
-public NTP server. Options: (a) add a narrow WAN-allow for UDP 123 only, or (b) push time from a
-LAN host over SSH — see `tools/timepush/`.
+The board has no RTC, so the clock powers on at ~2004 and resets on every boot; with WAN blocked it
+can't reach public NTP. Point it at a LAN time source `<NTP_HOST>` (e.g. a Pi running chrony with
+`allow <lan>/24`):
+
+- **Continuous sync (recommended).** Run the busybox `ntpd` client so the clock stays disciplined all
+  day, instead of drifting between a once-daily `ntpdate` (an RTC-less board drifts seconds per hour).
+  Footprint is negligible — ~364 kB RSS, ~0% CPU, normal (non-RT) priority:
+  ```sh
+  ntpdate -s -u <NTP_HOST>                         # step to correct now
+  pidof ntpd >/dev/null 2>&1 || ntpd -p <NTP_HOST>  # then keep it disciplined
+  ```
+- **Re-base stream timestamps after a cold boot.** At boot the clock sits at ~2004 for the first
+  ~30–60 s until NTP lands, and `strm_svc` often starts in that window and **latches 2004 into its
+  RTSP/RTP timestamps**. An NVR (e.g. AmberSight) then reports the camera's clock as ~22 years slow
+  even though the *system* clock is already correct. Fix by restarting `strm_svc` **after** the clock
+  is sane — `kunamonitor` respawns it immediately: `pkill -x strm_svc`.
+- **Persist both** in the boot path (`kunanetrules.ash`), guarded against duplicates:
+  ```sh
+  echo 'pidof ntpd >/dev/null 2>&1 || ntpd -p <NTP_HOST> >/dev/null 2>&1 &' >> /opt/kuna/scripts/kunanetrules.ash
+  # bounce strm_svc once, after the clock syncs, so it never latches 2004:
+  printf '%s\n' '( for i in $(seq 1 90); do y=$(date +%Y); if [ "$y" -ge 2020 ] && pidof strm_svc >/dev/null 2>&1; then sleep 5; pkill -x strm_svc; break; fi; sleep 2; done ) &' >> /opt/kuna/scripts/kunanetrules.ash
+  ```
+
+Alternatives: a narrow WAN-allow for UDP 123 only, or push time from a LAN host over SSH
+(`tools/timepush/`).
 
 ## 6. Verify
 ```sh

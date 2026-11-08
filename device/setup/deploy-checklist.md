@@ -56,8 +56,10 @@ All commands run on the camera (BusyBox / ash). Replace `<CAMERA_IP>`, `<NVR_IP>
       network): *Deny, LAN→WAN, Source = `<CAMERA_IP>`, Destination = Any, all protocols.* Keep
       LAN↔LAN intact so the NVR and SSH still reach it.
 
-- [ ] **6. Clock / time** (no RTC): schedule `tools/timepush/kuna-timepush.sh` from a LAN host, or
-      add a narrow WAN-allow for UDP 123 only. Verify the year is **not** 2004 after a few minutes.
+- [ ] **6. Clock / time** (no RTC): point the camera at a LAN NTP source and keep it disciplined —
+      continuous `ntpd -p <NTP_HOST>` plus a boot hook that bounces `strm_svc` once after the clock
+      syncs, so it doesn't latch the ~2004 power-on time into the stream and make the NVR report the
+      clock as decades slow. See `cloud-cut.md` §5. Verify the year is **not** 2004 and `pidof ntpd` is set.
 
 - [ ] **7. Resilience watchdog** — install `device/watchdog/kuna-watchdog.sh` at
       `/opt/kuna/ha/kuna-watchdog.sh`, **set `CONN=<WIFI_PROFILE>` for this unit**, and autostart it
@@ -89,7 +91,7 @@ echo "== ports open (want: 554 and 22) ==";     netstat -tln 2>/dev/null | grep 
 echo "== watchdog up + CONN set =="
 echo "  watchdog_pid=$(pgrep -f kuna-watchdog.sh || echo NONE)  CONN=$(grep -m1 '^CONN=' /opt/kuna/ha/kuna-watchdog.sh | cut -d= -f2 | cut -d' ' -f1)"
 echo "== HA bridge :8089 (want: a pid) ==";      echo "  httpd_8089=$(netstat -tln 2>/dev/null | grep -c ':8089 ')"
-echo "== clock sane (want: current year, not 2004) =="; date
+echo "== clock sane + ntpd (want: current year, not 2004, and an ntpd pid) =="; date; echo "  ntpd=$(pidof ntpd || echo NONE)"
 ```
 
 **All-clear looks like:** every cloud script `exit 0`, `pidof kunabeat=NONE`, `WAN_BLOCKED`,
