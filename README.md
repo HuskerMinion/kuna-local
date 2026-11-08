@@ -92,7 +92,10 @@ essential `kunaimage`, so it's cut at the network).
 
 > **Watch out:** once the cloud is blocked, the `kunabeat` connectivity watchdog panics — it
 > restarts Wi-Fi, the VPN, and eventually **reboots the whole unit, on a loop.** Neuter it too and
-> the unit becomes *more* stable than it was on the cloud.
+> the unit becomes *more* stable than it was on the cloud. This step is the easiest to miss and has
+> no immediate symptom (the unit looks fine until it reboot-loops ~16 min later), so convert each
+> unit against the per-unit checklist and run its **Verify gate** before walking away:
+> [`device/setup/deploy-checklist.md`](device/setup/deploy-checklist.md).
 
 ### 4. Local control + Home Assistant
 Everything runs off an on-device key/value store (`kunadb`, a Berkeley DB). This repo adds a tiny
@@ -163,7 +166,7 @@ ever differs (then you re-crack that one with the method above).
 ```
 device/ha-bridge/   on-camera HTTP->kunadb bridge (kuna CGI, bridge.sh, motion_led.sh)
 device/watchdog/    on-camera link/memory watchdog (heals Wi-Fi + strm_svc, never reboots)
-device/setup/       local RTSP, SSH, cloud-cut steps
+device/setup/       local RTSP, SSH, cloud-cut steps + per-unit deploy checklist (+ verify gate)
 homeassistant/      HA package (set CAMERA_IP)
 tools/timepush/     push time to the camera from a LAN host
 tools/healthlog/    sample camera health from a LAN host to catch offline incidents
