@@ -68,7 +68,7 @@ can't reach public NTP. Point it at a LAN time source `<NTP_HOST>` (e.g. a Pi ru
   ```
 - **Re-base stream timestamps after a cold boot.** At boot the clock sits at ~2004 for the first
   ~30–60 s until NTP lands, and `strm_svc` often starts in that window and **latches 2004 into its
-  RTSP/RTP timestamps**. An NVR (e.g. AmberSight) then reports the camera's clock as ~22 years slow
+  RTSP/RTP timestamps**. Your NVR then reports the camera's clock as ~22 years slow
   even though the *system* clock is already correct. Fix by restarting `strm_svc` **after** the clock
   is sane — `kunamonitor` respawns it immediately: `pkill -x strm_svc`.
 - **Persist both** in the boot path (`kunanetrules.ash`), guarded against duplicates:
